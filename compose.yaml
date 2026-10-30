@@ -1,0 +1,191 @@
+x-python-pipeline: &python-pipeline
+  build: ./ingest
+  image: firms-h3-portfolio-ingest:latest
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: firms-postgres
+    environment:
+      POSTGRES_DB: fire_analytics
+      POSTGRES_USER: fire_user
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+    command:
+      - postgres
+      - -c
+      - wal_level=logical
+      - -c
+      - max_wal_senders=10
+      - -c
+      - max_replication_slots=10
+      - -c
+      - max_slot_wal_keep_size=512MB
+    ports:
+      - "127.0.0.1:5434:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U fire_user -d fire_analytics"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  ingest:
+    <<: *python-pipeline
+    environment:
+      FIRMS_MAP_KEY: ${FIRMS_MAP_KEY:-}
+      FIRMS_SOURCE: ${FIRMS_SOURCE:-VIIRS_SNPP_NRT}
+      FIRMS_AREA: ${FIRMS_AREA:-94,-11,142,7}
+      FIRMS_DAY_RANGE: ${FIRMS_DAY_RANGE:-1}
+      FIRMS_START_DATE: ${FIRMS_START_DATE:-}
+      FIRMS_END_DATE: ${FIRMS_END_DATE:-}
+      POSTGRES_DB: fire_analytics
+      POSTGRES_USER: fire_user
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+      DB_HOST: postgres
+      DB_PORT: 5432
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  cdc-consumer:
+    <<: *python-pipeline
+    container_name: firms-cdc-consumer
+    command: ["python", "/app/cdc_consumer.py"]
+    environment:
+      POSTGRES_DB: fire_analytics
+      POSTGRES_USER: fire_user
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+      DB_HOST: postgres
+      DB_PORT: 5432
+      KAFKA_BOOTSTRAP_SERVERS: kafka:19092
+      CDC_TOPIC: firms.public.raw_firms_detections
+      CDC_CONSUMER_GROUP: firms-h3-cdc-consumer
+      H3_RESOLUTION: ${H3_RESOLUTION:-5}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    restart: unless-stopped
+
+  prefect-server:
+    <<: *python-pipeline
+    container_name: firms-prefect-server
+    command: ["prefect", "server", "start", "--host", "0.0.0.0"]
+    environment:
+      PREFECT_HOME: /root/.prefect
+      PREFECT_SERVER_API_HOST: 0.0.0.0
+      PREFECT_UI_API_URL: http://localhost:4200/api
+    ports:
+      - "127.0.0.1:4200:4200"
+    volumes:
+      - prefect_data:/root/.prefect
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:4200/api/health', timeout=5)"
+      interval: 10s
+      timeout: 6s
+      retries: 20
+      start_period: 30s
+    restart: unless-stopped
+
+  prefect-runner:
+    <<: *python-pipeline
+    container_name: firms-prefect-runner
+    command: ["python", "/app/prefect_flow.py"]
+    environment:
+      FIRMS_MAP_KEY: ${FIRMS_MAP_KEY:-}
+      FIRMS_SOURCE: ${FIRMS_SOURCE:-VIIRS_SNPP_NRT}
+      FIRMS_AREA: ${FIRMS_AREA:-94,-11,142,7}
+      FIRMS_DAY_RANGE: "5"
+      FIRMS_START_DATE: ""
+      FIRMS_END_DATE: ""
+      POSTGRES_DB: fire_analytics
+      POSTGRES_USER: fire_user
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+      DB_HOST: postgres
+      DB_PORT: 5432
+      PREFECT_API_URL: http://prefect-server:4200/api
+      PREFECT_RUN_ON_STARTUP: ${PREFECT_RUN_ON_STARTUP:-true}
+      KAFKA_BOOTSTRAP_SERVERS: kafka:19092
+    depends_on:
+      postgres:
+        condition: service_healthy
+      prefect-server:
+        condition: service_healthy
+    restart: unless-stopped
+
+  dashboard:
+    build: ./dashboard
+    container_name: firms-dashboard
+    environment:
+      DB_HOST: postgres
+      DB_PORT: 5432
+      POSTGRES_DB: fire_analytics
+      POSTGRES_USER: fire_user
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+    ports:
+      - "127.0.0.1:8501:8501"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  kafka:
+    image: apache/kafka:4.3.1
+    container_name: firms-kafka
+    hostname: kafka
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: "CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT"
+      KAFKA_ADVERTISED_LISTENERS: "PLAINTEXT://kafka:19092"
+      KAFKA_PROCESS_ROLES: "broker,controller"
+      KAFKA_CONTROLLER_QUORUM_VOTERS: "1@kafka:29093"
+      KAFKA_LISTENERS: "CONTROLLER://:29093,PLAINTEXT://:19092"
+      KAFKA_INTER_BROKER_LISTENER_NAME: "PLAINTEXT"
+      KAFKA_CONTROLLER_LISTENER_NAMES: "CONTROLLER"
+      CLUSTER_ID: "4L6g3nShT-eMCtK--X86sw"
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_SHARE_COORDINATOR_STATE_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_SHARE_COORDINATOR_STATE_TOPIC_MIN_ISR: 1
+      KAFKA_LOG_DIRS: /tmp/kraft-combined-logs
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:19092 --list >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      start_period: 20s
+
+  connect:
+    image: quay.io/debezium/connect:3.4
+    container_name: firms-connect
+    ports:
+      - "127.0.0.1:18083:8083"
+    environment:
+      BOOTSTRAP_SERVERS: kafka:19092
+      GROUP_ID: "1"
+      CONFIG_STORAGE_TOPIC: firms_connect_configs
+      OFFSET_STORAGE_TOPIC: firms_connect_offsets
+      STATUS_STORAGE_TOPIC: firms_connect_statuses
+      CONFIG_STORAGE_REPLICATION_FACTOR: 1
+      OFFSET_STORAGE_REPLICATION_FACTOR: 1
+      STATUS_STORAGE_REPLICATION_FACTOR: 1
+      KEY_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+      VALUE_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+      KEY_CONVERTER_SCHEMAS_ENABLE: "false"
+      VALUE_CONVERTER_SCHEMAS_ENABLE: "false"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  prefect_data:

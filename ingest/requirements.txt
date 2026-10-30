@@ -1,0 +1,6 @@
+psycopg[binary]==3.2.9
+requests==2.32.3
+h3==4.3.1
+prefect==3.9.0
+confluent-kafka==2.8.0
+

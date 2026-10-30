@@ -1,0 +1,35 @@
+# Rahasia & Konfigurasi Lokal
+.env
+.env.*
+!.env.example
+
+# Catatan Internal & Konfigurasi AI Agent / IDE
+.agents/
+.gemini/
+.claude/
+.cursor/
+.vscode/
+.idea/
+docs/
+
+# Log, Backup Database, & Cache Python
+logs/
+backups/
+*.dump
+*.sql.gz
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Virtual Environment
+.venv/
+venv/
+env/
+
+# File Sistem Operasi
+.DS_Store
+Thumbs.db
+Desktop.ini
